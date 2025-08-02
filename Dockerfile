@@ -1,0 +1,289 @@
+# syntax = docker/dockerfile:1.4
+# image = yaserguey/netxms:5.2.4
+
+FROM scratch
+
+MAINTAINER Serguey Kutovoy "ya.serguey@yandex.ru"
+LABEL org.opencontainers.image.authors="ya.serguey@yandex.ru"
+LABEL org.opencontainers.image.base.name="debian:12"
+
+ARG NETXMS_VERSION=5.2
+ARG NETXMS_SUBVERSION=${NETXMS_VERSION}.4
+ARG NXMC_VERSION=${NETXMS_SUBVERSION}
+#ARG NXMC_VERSION=legacy-${NETXMS_SUBVERSION}
+ARG NXMC_URL=https://netxms.com/download/releases/${NETXMS_VERSION}/nxmc-${NXMC_VERSION}.war
+
+COPY --from=ghcr.io/netxms/server:5.2.4 . .
+COPY --from=ghcr.io/netxms/agent:5.2.4 . .
+
+ENV LC_ALL en_US.UTF-8
+ENV LANG en_US.UTF-8
+ENV LANGUAGE en_US:en
+
+ARG JAVA_VERSION=17
+
+RUN <<INSTALL_PACKAGES
+  set -eux
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y locales tzdata
+  localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
+  locale
+  # for debian jdk
+  mkdir -p /usr/share/man/man1 /usr/share/man/man2
+  apt-get install -y --no-install-recommends \
+  curl sudo openssl apt-transport-https ca-certificates \
+  net-tools supervisor lsb-release openjdk-${JAVA_VERSION}-jre-headless
+
+  # clean
+  apt-get autoremove -y
+  apt-get clean -y
+	rm -rf \
+		/var/lib/apt/lists/* \
+		/var/cache/apt/* \
+		/usr/share/doc/* \
+		/usr/share/man/* \
+		/tmp/* \
+    /var/tmp/* \
+    /var/log/alternatives.log \
+    /var/log/apt/ \
+    /var/log/bootstrap.log \
+    /var/log/btmp \
+    /var/log/dpkg.log \
+    /var/log/faillog \
+    /var/log/fsck/ \
+    /var/log/lastlog \
+    /var/log/wtmp
+INSTALL_PACKAGES
+
+WORKDIR /opt/netxmsdb
+WORKDIR /root
+
+ARG JETTY_HOME=/opt/jetty
+ENV JETTY_HOME=${JETTY_HOME}
+ARG JETTY_VERSION=12.0.23
+ADD https://repo1.maven.org/maven2/org/eclipse/jetty/jetty-home/${JETTY_VERSION}/jetty-home-${JETTY_VERSION}.tar.gz /root/jetty-home-${JETTY_VERSION}.tar.gz
+
+RUN <<INSTALL_JETTY
+  set -eux
+  tar -xvf jetty-home-${JETTY_VERSION}.tar.gz -C /opt
+  ln -s /opt/jetty-home-${JETTY_VERSION} ${JETTY_HOME}
+INSTALL_JETTY
+
+ENV JETTY_BASE=/opt/netxms-webui
+WORKDIR /opt/netxms-webui
+ARG JETTY_BASE=/opt/netxms-webui
+
+RUN <<PREPARE_NXMC
+  set -eux
+
+  mkdir -p ${JETTY_BASE}/etc ${JETTY_BASE}/logs && cd ${JETTY_BASE}
+  java -jar ${JETTY_HOME}/start.jar --add-modules=ee8-deploy,ee8-webapp,ee8-plus,gzip,http,http2,https,logging-logback,plus,server,ssl,work --approve-all-licenses
+
+PREPARE_NXMC
+
+ADD ${NXMC_URL} ${JETTY_BASE}/webapps/ROOT.war
+
+RUN <<INSTALL_NXMC
+  set -eux
+
+  keytool -genkeypair -alias jetty -keyalg RSA -keysize 2048 -keystore ${JETTY_BASE}/etc/keystore.p12 -storetype PKCS12 -storepass password -keypass password -validity 3650 -dname "CN=netxms-webui, OU=netxms, O=netxms, L=netxms, ST=netxms, C=netxms"
+
+  sed 's,# jetty.sslContext.keyStorePassword=,jetty.sslContext.keyStorePassword=password,' -i'' start.d/ssl.ini
+
+  echo "jetty.sslContext.keyStorePassword=password" > ${JETTY_BASE}/jetty-ssl.properties
+  echo "jetty.ssl.sniRequired=false" >> ${JETTY_BASE}/jetty-ssl.properties
+  echo "jetty.ssl.sniHostCheck=false" >> ${JETTY_BASE}/jetty-ssl.properties
+
+  java -jar ${JETTY_HOME}/start.jar --add-modules=ee8-deploy,ee8-webapp,ee8-plus,gzip,http,http2,https,logging-logback,plus,server,ssl,work --approve-all-licenses
+
+INSTALL_NXMC
+
+COPY --chmod=555 <<'EOF' ${JETTY_BASE}/webapps/ROOT.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE Configure PUBLIC "-//Jetty//Configure//EN" "https://www.eclipse.org/jetty/configure_12_0.dtd">
+
+<Configure class="org.eclipse.jetty.ee8.webapp.WebAppContext">
+    <Set name="contextPath">/</Set>
+    <Set name="war">/opt/netxms-webui/webapps/ROOT.war</Set>
+    <Set name="extractWAR">true</Set>
+    <New class="org.eclipse.jetty.plus.jndi.EnvEntry">
+        <Arg>nxmc/server</Arg>
+        <Arg>127.0.0.1</Arg>
+        <Arg type="boolean">true</Arg>
+    </New>
+</Configure>
+EOF
+
+COPY --chmod=555 <<'EOF' /etc/supervisor/supervisord.conf
+[supervisord]
+nodaemon=true
+user=root
+logfile=/dev/stdout
+logfile_maxbytes=0
+loglevel=info
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+[unix_http_server]
+file=/tmp/supervisor.sock
+chmod=0777
+[supervisorctl]
+serverurl=unix:///tmp/supervisor.sock
+[inet_http_server]
+port = *:9001
+[include]
+files = /etc/supervisor/conf.d/*.conf
+EOF
+
+COPY --chmod=555 <<'EOF' /etc/supervisor/conf.d/netxms.conf
+[program:netxms-server]
+command=/usr/bin/netxmsd -q -c /etc/netxmsd.conf
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+priority=1
+EOF
+
+COPY --chmod=555 <<'EOF' /etc/supervisor/conf.d/nxagent.conf
+[program:netxms-agent]
+command=/usr/bin/nxagentd -f -c /etc/nxagentd.conf
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+priority=2
+EOF
+
+COPY --chmod=555 <<'EOF' /etc/supervisor/conf.d/nxmc.conf
+[program:nxmc-webui]
+environment=JETTY_BASE=/opt/netxms-webui,JETTY_HOME=/opt/jetty
+directory=/opt/netxms-webui
+command=java -Dnxmc.server=127.0.0.1 -Dnxmc.debuglevel=0 -Dnxmc.logfile=/opt/netxms-webui/logs/nxmc.log -jar /opt/jetty/start.jar
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+redirect_stderr=true
+priority=3
+EOF
+
+COPY --chmod=555 <<'EOF' /etc/netxmsd.conf
+## Logging
+# Log file name
+LogFile=/var/log/netxmsd
+LogRotationMode = 1
+# Increase logging verbosity, 0 (only errors) to 9 (verbose debug)
+DebugLevel=0
+LogFailedSQLQueries = no
+## Database configuration.
+## Option #1 - SQLite (for test installations only):
+DBDriver=sqlite.ddr
+DBName=/opt/netxmsdb/netxms.db
+ManagementAgentAddress=127.0.0.1
+EOF
+
+COPY --chmod=555 <<'EOF' /etc/nxagentd.conf
+# Log File
+LogFile=/var/log/nxagentd
+DebugLevel=0
+# IP white list, can contain multiple records separated by comma.
+# CIDR notation supported for subnets.
+#MasterServers=127.0.0.0/8,172.17.0.0/16
+MasterServers=127.0.0.1
+EnableProxy=yes
+EnableSNMPProxy=yes
+EnableSNMPTrapProxy=yes
+EnableSyslogProxy=yes
+EnableTCPProxy=yes
+##EnableWebServiceProxy=yes
+EOF
+
+COPY --chmod=755 <<'EOF' /docker-entrypoint.sh
+#!/bin/bash
+
+set -e
+
+if [ -n "${DEBUG}" ]; then
+  set -x
+  DEBUG_FIND="-print"
+  CONFD_LOGLEVEL="-log-level debug"
+fi
+
+CURRENT_UID=$(id -u)
+if [[ ${CURRENT_UID} != 0 ]]; then
+    echo "[WARN] Host UID/GID usage disabled because the container is not running under the root (current uid: ${CURRENT_UID})"
+    exec "$@"
+    exit
+fi
+
+if [ ! -e "/opt/netxmsdb/.initializedv1" ];
+then
+        echo "Initializing NetXMS SQLLite database"
+        nxdbmgr init
+
+        touch /opt/netxmsdb/.initializedv1
+fi
+
+if [ "$NETXMS_UNLOCKONSTARTUP" -gt 0 ];
+then
+        echo "Unlocking database"
+        echo "Y"|nxdbmgr unlock
+fi
+
+if [ "$NETXMS_UPGRADEDB" -gt 0 ];
+then
+        echo "Upgrading db schema"
+        echo "Y"|nxdbmgr unlock
+        echo "Y"|nxdbmgr upgrade
+fi
+
+#exec /usr/bin/supervisord
+exec "$@"
+
+EOF
+
+COPY --chmod=755 <<'EOF' /healthcheck.sh
+#!/bin/bash
+
+set -e
+
+if [ -n "${DEBUG}" ]; then
+  set -x
+  DEBUG_FIND="-print"
+  CONFD_LOGLEVEL="-log-level debug"
+fi
+
+exec netstat -an | grep 4701 > /dev/null; if [ 0 != $? ]; then exit 1; fi;
+EOF
+
+EXPOSE 9001
+
+VOLUME [/etc/netxms]
+VOLUME [/opt/netxmsdb]
+VOLUME [/var/lib/netxms]
+# server expose
+# client (gui or integration tools) -> server
+#EXPOSE 4701/tcp
+# client (gui or integration tools) -> server
+#EXPOSE 4703/tcp
+# mobile agent -> server
+#EXPOSE 4747/tcp
+# NetXMS Server Synchronization
+#EXPOSE 4702/tcp
+
+
+# agent expose
+# server -> agent
+EXPOSE 4700/tcp
+# SNMP
+EXPOSE 162/udp
+# Syslog
+EXPOSE 514/udp
+
+# web app expose
+EXPOSE 8080/tcp
+EXPOSE 8443/tcp
+
+ENV NETXMS_UNLOCKONSTARTUP=1 NETXMS_UPGRADEDB=1
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=5 CMD /healthcheck.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["/usr/bin/supervisord", "-n","-c","/etc/supervisor/supervisord.conf"]
